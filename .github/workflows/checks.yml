@@ -1,0 +1,60 @@
+name: Checks
+
+# Reusable gate. Caller repo isko is tarah bulata hai:
+#
+#   jobs:
+#     checks:
+#       uses: OWNER/ci-workflows/.github/workflows/checks.yml@v1
+#
+# Branch protection mein isi job ko required banao — merge yahin rukta hai.
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node version to run on.
+        type: string
+        default: '24'
+      typecheck-command:
+        description: Type check. Khaali string dene par step skip ho jaata hai.
+        type: string
+        default: 'npx tsc -b'
+      lint-command:
+        type: string
+        default: 'npm run lint'
+      test-command:
+        type: string
+        default: 'npm test'
+      install-command:
+        description: Lockfile na ho to "npm install" pass karo.
+        type: string
+        default: 'npm ci'
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - run: ${{ inputs.install-command }}
+
+      # tsc -b, kyunki solution-style tsconfig ("files": []) par
+      # `tsc --noEmit` ek bhi file check nahi karta.
+      - name: TypeScript
+        if: inputs.typecheck-command != ''
+        run: ${{ inputs.typecheck-command }}
+
+      - name: Lint
+        if: inputs.lint-command != ''
+        run: ${{ inputs.lint-command }}
+
+      - name: Tests
+        if: inputs.test-command != ''
+        run: ${{ inputs.test-command }}

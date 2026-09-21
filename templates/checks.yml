@@ -1,0 +1,11 @@
+name: Checks
+
+on:
+  pull_request:
+    branches: [__BASE_BRANCHES__]
+  push:
+    branches: [__BASE_BRANCHES__]
+
+jobs:
+  checks:
+    uses: __OWNER__/ci-workflows/.github/workflows/checks.yml@__REF__

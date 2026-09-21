@@ -1,0 +1,11 @@
+name: Post-merge Summary
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [__BASE_BRANCHES__]
+
+jobs:
+  summary:
+    uses: __OWNER__/ci-workflows/.github/workflows/post-merge-summary.yml@__REF__
+    secrets: inherit

@@ -1,0 +1,11 @@
+name: PR Impact
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [__BASE_BRANCHES__]
+
+jobs:
+  impact:
+    uses: __OWNER__/ci-workflows/.github/workflows/pr-impact.yml@__REF__
+    secrets: inherit

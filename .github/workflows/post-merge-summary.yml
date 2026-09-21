@@ -1,0 +1,204 @@
+name: Post-merge Summary
+
+# Merge ke baad chalta hai. Summary PR par, merge commit par, aur Actions run
+# par — teeno jagah.
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '24'
+      install-command:
+        type: string
+        default: 'npm ci'
+      source-dir:
+        type: string
+        default: 'src'
+      tools-ref:
+        type: string
+        default: 'v1'
+      typecheck-command:
+        type: string
+        default: 'npx tsc -b'
+      lint-command:
+        type: string
+        default: 'npm run lint'
+      test-command:
+        type: string
+        default: 'npm test'
+      model:
+        type: string
+        default: 'claude-sonnet-4.5'
+    secrets:
+      COPILOT_PAT:
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  summary:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check out the tools
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ci-workflows
+          ref: ${{ inputs.tools-ref }}
+          path: .ci-tools
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+
+      - run: ${{ inputs.install-command }}
+
+      - name: Install the tools
+        working-directory: .ci-tools
+        run: npm ci --omit=dev --ignore-scripts || npm ci
+
+      - name: Collect merge data
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          {
+            echo "CHANGED_FILES<<GHEOF"
+            git diff --name-only "$BASE_SHA...$HEAD_SHA"
+            echo "GHEOF"
+            echo "COMMIT_LINES<<GHEOF"
+            git log --format='%s' "$BASE_SHA..$HEAD_SHA"
+            echo "GHEOF"
+          } >> "$GITHUB_ENV"
+
+          git diff "$BASE_SHA...$HEAD_SHA" -- . ':(exclude)package-lock.json' | head -c 60000 > /tmp/diff.txt
+
+      # Merged code par checks dobara chalte hain. PR green tha iska matlab nahi
+      # ki merge ke baad bhi green hai — base uske neeche se badal chuka hota hai.
+      - name: Verify the merged code
+        id: verify
+        run: |
+          set +e
+          : > /tmp/detail.txt
+
+          run_check() {
+            local name="$1" cmd="$2" out="/tmp/$3.log"
+            if [ -z "$cmd" ]; then echo ""; return; fi
+            eval "$cmd" > "$out" 2>&1
+            local status=$?
+            if [ "$status" != "0" ]; then
+              { echo "--- $name ---"; tail -n 20 "$out"; echo; } >> /tmp/detail.txt
+            fi
+            echo "$status"
+          }
+
+          {
+            echo "CHECK_TS=$(run_check TypeScript '${{ inputs.typecheck-command }}' tsc)"
+            echo "CHECK_LINT=$(run_check Lint '${{ inputs.lint-command }}' lint)"
+            echo "CHECK_TEST=$(run_check Tests '${{ inputs.test-command }}' test)"
+          } >> "$GITHUB_ENV"
+
+          TOTALS=$(grep -Eo '[0-9]+ (passed|failed)[^|]*' /tmp/test.log 2>/dev/null | tail -n 1)
+          echo "TEST_TOTALS=${TOTALS}" >> "$GITHUB_ENV"
+
+          {
+            echo "CHECK_DETAIL<<GHEOF"
+            head -c 2000 /tmp/detail.txt
+            echo
+            echo "GHEOF"
+          } >> "$GITHUB_ENV"
+
+      - name: Build the summary
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          SOURCE_DIR: ${{ inputs.source-dir }}
+        run: node .ci-tools/scripts/merge-summary.mjs > /tmp/summary.md
+
+      - name: Check whether Copilot is configured
+        id: check
+        env:
+          COPILOT_PAT: ${{ secrets.COPILOT_PAT }}
+        run: |
+          if [ -n "$COPILOT_PAT" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build the Copilot prompt
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          {
+            echo "Below is the diff of a pull request that was just merged."
+            echo "Write a summary of it in English."
+            echo
+            echo "Format:"
+            echo "- 2-3 lines: what this merge changed, from a user/product point of view."
+            echo "- A '### What to watch' heading with 2-4 bullets:"
+            echo "  risky bits, missing tests, or follow-ups worth doing."
+            echo
+            echo "Rules: only state what the diff actually shows. Do not guess."
+            echo "Do not use headings larger than '###'. Do not paste the diff back."
+            echo
+            echo "PR title: $PR_TITLE"
+            echo
+            echo "Diff:"
+            echo '```diff'
+            cat /tmp/diff.txt
+            echo '```'
+          } > /tmp/prompt.txt
+
+      - name: Install the Copilot CLI
+        if: steps.check.outputs.enabled == 'true'
+        run: npm install -g @github/copilot
+
+      - name: Ask Copilot for a summary
+        id: ai
+        if: steps.check.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: actions/ai-inference@v1
+        with:
+          prompt-file: /tmp/prompt.txt
+          model: ${{ inputs.model }}
+          system-prompt: >-
+            You are a senior engineer writing a short, plain summary of changes
+            that were just merged. Write in English. Only state what the diff
+            clearly shows.
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+
+      - name: Append the Copilot section
+        if: steps.ai.outcome == 'success' && steps.ai.outputs.response != ''
+        env:
+          AI_RESPONSE: ${{ steps.ai.outputs.response }}
+        run: |
+          { echo; echo "### 🤖 Copilot summary"; echo; echo "$AI_RESPONSE"; } >> /tmp/summary.md
+
+      - name: Comment on the PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: merge-summary
+          number: ${{ github.event.pull_request.number }}
+          path: /tmp/summary.md
+
+      - name: Comment on the merge commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        run: gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/comments" -F body=@/tmp/summary.md
+
+      - name: Show it on the Actions run too
+        if: always()
+        run: cat /tmp/summary.md >> "$GITHUB_STEP_SUMMARY"

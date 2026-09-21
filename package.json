@@ -1,0 +1,18 @@
+{
+  "name": "ci-workflows",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Reusable GitHub Actions workflows: checks gate, PR impact report, post-merge summary.",
+  "scripts": {
+    "test": "vitest run",
+    "init": "node scripts/init.mjs"
+  },
+  "devDependencies": {
+    "dependency-cruiser": "~18.4.0",
+    "vitest": "^5.0.1"
+  },
+  "dependencies": {
+    "typescript": "~6.0.2"
+  }
+}

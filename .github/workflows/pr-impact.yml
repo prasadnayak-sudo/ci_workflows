@@ -1,0 +1,169 @@
+name: PR Impact
+
+# Report banata hai — ye gate nahi hai. Merge rokne ke liye checks.yml ki
+# `tests` job ko required banao.
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: '24'
+      install-command:
+        type: string
+        default: 'npm ci'
+      source-dir:
+        description: Import graph kis folder ka bane.
+        type: string
+        default: 'src'
+      tools-ref:
+        description: ci-workflows ka wahi ref jis se ye workflow aaya.
+        type: string
+        default: 'v1'
+      model:
+        type: string
+        default: 'claude-sonnet-4.5'
+    secrets:
+      COPILOT_PAT:
+        description: Copilot prose ke liye. Na ho to sirf facts wali summary aayegi.
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  impact:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the caller repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Scripts central repo se aate hain — consumer repo mein kuch install
+      # nahi karna padta.
+      - name: Check out the tools
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/ci-workflows
+          ref: ${{ inputs.tools-ref }}
+          path: .ci-tools
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install the tools
+        working-directory: .ci-tools
+        run: npm ci --omit=dev --ignore-scripts || npm ci
+
+      - name: Collect changed files
+        run: |
+          git fetch origin "${{ github.base_ref }}"
+          BASE="origin/${{ github.base_ref }}"
+          {
+            echo "CHANGED_FILES<<GHEOF"
+            git diff --name-only "$BASE...HEAD"
+            echo "GHEOF"
+            echo "COMMIT_LINES<<GHEOF"
+            git log --format=%s "$BASE..HEAD"
+            echo "GHEOF"
+          } >> "$GITHUB_ENV"
+
+          git diff "$BASE...HEAD" -- . ':(exclude)package-lock.json' | head -c 60000 > /tmp/diff.txt
+
+      - name: Build the impact report
+        env:
+          CHANGED_FILES: ${{ env.CHANGED_FILES }}
+          SOURCE_DIR: ${{ inputs.source-dir }}
+        run: node .ci-tools/scripts/impact-report.mjs > /tmp/impact.md
+
+      - name: Comment on the PR
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: pr-impact
+          path: /tmp/impact.md
+
+      - name: Build the factual summary
+        env:
+          CHANGED_FILES: ${{ env.CHANGED_FILES }}
+          COMMIT_LINES: ${{ env.COMMIT_LINES }}
+          SOURCE_DIR: ${{ inputs.source-dir }}
+        run: node .ci-tools/scripts/commit-summary.mjs > /tmp/facts.md
+
+      - name: Check whether Copilot is configured
+        id: check
+        env:
+          COPILOT_PAT: ${{ secrets.COPILOT_PAT }}
+        run: |
+          if [ -n "$COPILOT_PAT" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "COPILOT_PAT is not set — the commit summary will be facts only." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Build the Copilot prompt
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          {
+            echo "Below is the diff of a pull request."
+            echo "Write the BODY of its commit message in English."
+            echo
+            echo "Rules:"
+            echo "- Explain what changed and why. Plain prose, 2-4 short paragraphs."
+            echo "- No markdown headings, no bold, no bullet lists unless truly needed."
+            echo "- Do not repeat the PR title. Do not paste the diff back."
+            echo "- Do not list file names or counts - that is added separately."
+            echo "- Only state what the diff actually shows. Do not guess intent."
+            echo "- Wrap lines at about 72 characters."
+            echo
+            echo "PR title: $PR_TITLE"
+            echo
+            echo "Diff:"
+            echo '```diff'
+            cat /tmp/diff.txt
+            echo '```'
+          } > /tmp/prompt.txt
+
+      - name: Install the Copilot CLI
+        if: steps.check.outputs.enabled == 'true'
+        run: npm install -g @github/copilot
+
+      - name: Ask Copilot to write the message
+        id: ai
+        if: steps.check.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: actions/ai-inference@v1
+        with:
+          prompt-file: /tmp/prompt.txt
+          model: ${{ inputs.model }}
+          system-prompt: >-
+            You write commit messages. Plain, specific, and short. You describe
+            what changed and why it changed, never how impressive it is. Write
+            in English.
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+
+      - name: Assemble the summary block
+        env:
+          AI_RESPONSE: ${{ steps.ai.outputs.response }}
+        run: |
+          if [ -n "$AI_RESPONSE" ]; then
+            { echo "$AI_RESPONSE"; echo; cat /tmp/facts.md; } > /tmp/summary.md
+          else
+            cp /tmp/facts.md /tmp/summary.md
+          fi
+
+      - name: Write the summary into the PR description
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          SUMMARY="$(cat /tmp/summary.md)"
+          export SUMMARY
+          node .ci-tools/scripts/update-pr-body.mjs > /tmp/body.md
+          gh pr edit "$PR_NUMBER" --body-file /tmp/body.md
