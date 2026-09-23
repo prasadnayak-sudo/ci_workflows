@@ -28,6 +28,10 @@ on:
         description: Lockfile na ho to "npm install" pass karo.
         type: string
         default: 'npm ci'
+      source-dir:
+        description: Source directory for dependency-cruiser import check.
+        type: string
+        default: 'src'
 
 permissions:
   contents: read
@@ -47,6 +51,7 @@ jobs:
           node-version: ${{ inputs.node-version }}
           cache: npm
 
+      # Sirf ek baar npm ci — sab steps isi node_modules se chalte hain
       - name: Install dependencies
         run: ${{ inputs.install-command }}
 
@@ -61,3 +66,9 @@ jobs:
       - name: Run tests
         if: inputs.test-command != ''
         run: ${{ inputs.test-command }}
+
+      - name: Check imports (dependency-cruiser)
+        run: |
+          npm install --no-save --no-package-lock 'dependency-cruiser@^18.3.1'
+          npx depcruise ${{ inputs.source-dir }} --config node_modules/dependency-cruiser/configs/recommended
+        continue-on-error: true
