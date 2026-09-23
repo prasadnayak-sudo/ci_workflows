@@ -1,39 +1,29 @@
 name: Post-merge Summary
 
-# Merge ke baad chalta hai. Summary PR par, merge commit par, aur Actions run
-# par — teeno jagah.
+# Reusable. Runs after a PR is merged. Posts a summary on the PR and on the
+# merge commit.
 on:
   workflow_call:
     inputs:
       node-version:
+        description: Node version to run on.
         type: string
         default: '24'
-      install-command:
+      tools-path:
+        description: Directory this repo is checked out into, inside the caller workspace.
         type: string
-        default: 'npm ci'
-      source-dir:
-        type: string
-        default: 'src'
+        default: .ci-tools
       tools-ref:
+        description: Ref of ci_workflows to take the scripts from. Keep it equal to the @ref the caller uses.
         type: string
-        default: 'v1'
-      typecheck-command:
-        type: string
-        default: 'npx tsc -b'
-      lint-command:
-        type: string
-        default: 'npm run lint'
-      test-command:
-        type: string
-        default: 'npm test'
-      model:
-        type: string
-        default: 'claude-sonnet-4.5'
+        default: v1
     secrets:
       COPILOT_PAT:
+        description: PAT for the Copilot-written prose. Without it, the deterministic summary only.
         required: false
 
 permissions:
+  # contents: write is needed to comment on the merge commit.
   contents: write
   pull-requests: write
 
@@ -46,23 +36,29 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check out the tools
+      # Scripts aur depcruise config isi repo se aate hain, caller se nahi.
+      - name: Check out the shared tools
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/ci-workflows
+          repository: prasadnayak-sudo/ci_workflows
           ref: ${{ inputs.tools-ref }}
-          path: .ci-tools
+          path: ${{ inputs.tools-path }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
           cache: npm
 
-      - run: ${{ inputs.install-command }}
+      - run: npm ci
 
-      - name: Install the tools
-        working-directory: .ci-tools
-        run: npm ci --omit=dev --ignore-scripts || npm ci
+      # graph.mjs cwd mein config dhoondta hai aur `npx depcruise` chalata hai,
+      # isliye dono caller ke root par pohanchane padte hain.
+      - name: Set up dependency-cruiser
+        env:
+          TOOLS: ${{ inputs.tools-path }}
+        run: |
+          cp "$TOOLS/.dependency-cruiser.cjs" .
+          npm install --no-save 'dependency-cruiser@^18.3.1'
 
       - name: Collect merge data
         env:
@@ -78,51 +74,18 @@ jobs:
             echo "GHEOF"
           } >> "$GITHUB_ENV"
 
+          # Diff for the AI prompt: lock file excluded and size capped,
+          # otherwise the prompt gets huge.
           git diff "$BASE_SHA...$HEAD_SHA" -- . ':(exclude)package-lock.json' | head -c 60000 > /tmp/diff.txt
 
-      # Merged code par checks dobara chalte hain. PR green tha iska matlab nahi
-      # ki merge ke baad bhi green hai — base uske neeche se badal chuka hota hai.
-      - name: Verify the merged code
-        id: verify
-        run: |
-          set +e
-          : > /tmp/detail.txt
-
-          run_check() {
-            local name="$1" cmd="$2" out="/tmp/$3.log"
-            if [ -z "$cmd" ]; then echo ""; return; fi
-            eval "$cmd" > "$out" 2>&1
-            local status=$?
-            if [ "$status" != "0" ]; then
-              { echo "--- $name ---"; tail -n 20 "$out"; echo; } >> /tmp/detail.txt
-            fi
-            echo "$status"
-          }
-
-          {
-            echo "CHECK_TS=$(run_check TypeScript '${{ inputs.typecheck-command }}' tsc)"
-            echo "CHECK_LINT=$(run_check Lint '${{ inputs.lint-command }}' lint)"
-            echo "CHECK_TEST=$(run_check Tests '${{ inputs.test-command }}' test)"
-          } >> "$GITHUB_ENV"
-
-          TOTALS=$(grep -Eo '[0-9]+ (passed|failed)[^|]*' /tmp/test.log 2>/dev/null | tail -n 1)
-          echo "TEST_TOTALS=${TOTALS}" >> "$GITHUB_ENV"
-
-          {
-            echo "CHECK_DETAIL<<GHEOF"
-            head -c 2000 /tmp/detail.txt
-            echo
-            echo "GHEOF"
-          } >> "$GITHUB_ENV"
-
-      - name: Build the summary
+      # This part always runs — it does not depend on the AI.
+      - name: Build the deterministic summary
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
-          SOURCE_DIR: ${{ inputs.source-dir }}
-        run: node .ci-tools/scripts/merge-summary.mjs > /tmp/summary.md
+        run: node "${{ inputs.tools-path }}/scripts/merge-summary.mjs" > /tmp/summary.md
 
       - name: Check whether Copilot is configured
         id: check
@@ -133,12 +96,14 @@ jobs:
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "COPILOT_PAT secret is not set — posting the deterministic summary only." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Build the Copilot prompt
         if: steps.check.outputs.enabled == 'true'
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           {
             echo "Below is the diff of a pull request that was just merged."
@@ -148,11 +113,15 @@ jobs:
             echo "- 2-3 lines: what this merge changed, from a user/product point of view."
             echo "- A '### What to watch' heading with 2-4 bullets:"
             echo "  risky bits, missing tests, or follow-ups worth doing."
+            echo "- Call out any behaviour change separately."
             echo
             echo "Rules: only state what the diff actually shows. Do not guess."
             echo "Do not use headings larger than '###'. Do not paste the diff back."
             echo
             echo "PR title: $PR_TITLE"
+            echo
+            echo "PR description:"
+            echo "$PR_BODY"
             echo
             echo "Diff:"
             echo '```diff'
@@ -164,6 +133,7 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         run: npm install -g @github/copilot
 
+      # If the AI step fails the summary must still be posted, hence continue-on-error.
       - name: Ask Copilot for a summary
         id: ai
         if: steps.check.outputs.enabled == 'true'
@@ -171,7 +141,7 @@ jobs:
         uses: actions/ai-inference@v1
         with:
           prompt-file: /tmp/prompt.txt
-          model: ${{ inputs.model }}
+          model: claude-sonnet-4.5
           system-prompt: >-
             You are a senior engineer writing a short, plain summary of changes
             that were just merged. Write in English. Only state what the diff
@@ -184,7 +154,20 @@ jobs:
         env:
           AI_RESPONSE: ${{ steps.ai.outputs.response }}
         run: |
-          { echo; echo "### 🤖 Copilot summary"; echo; echo "$AI_RESPONSE"; } >> /tmp/summary.md
+          {
+            echo
+            echo "### 🤖 Copilot summary"
+            echo
+            echo "$AI_RESPONSE"
+          } >> /tmp/summary.md
+
+      - name: Note it when the AI step fails
+        if: steps.check.outputs.enabled == 'true' && steps.ai.outcome != 'success'
+        run: |
+          {
+            echo
+            echo "_🤖 The Copilot summary was not generated this time — check the 'Ask Copilot for a summary' step in the workflow logs._"
+          } >> /tmp/summary.md
 
       - name: Comment on the PR
         uses: marocchino/sticky-pull-request-comment@v2
@@ -193,6 +176,8 @@ jobs:
           number: ${{ github.event.pull_request.number }}
           path: /tmp/summary.md
 
+      # Also attach the summary to the merge commit, so anyone reading the
+      # history — rather than the PR — still finds it.
       - name: Comment on the merge commit
         env:
           GH_TOKEN: ${{ github.token }}

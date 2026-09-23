@@ -1,10 +1,10 @@
-name: Checks
+﻿name: Checks
 
 # Reusable gate. Caller repo isko is tarah bulata hai:
 #
 #   jobs:
 #     checks:
-#       uses: OWNER/ci-workflows/.github/workflows/checks.yml@v1
+#       uses: prasadnayak-sudo/ci_workflows/.github/workflows/checks.yml@v1
 #
 # Branch protection mein isi job ko required banao — merge yahin rukta hai.
 on:
@@ -33,8 +33,12 @@ permissions:
   contents: read
 
 jobs:
-  tests:
+  checks:
+    name: Checks
     runs-on: ubuntu-latest
+    concurrency:
+      group: checks-${{ github.repository }}-${{ github.event_name }}-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
 
@@ -43,18 +47,17 @@ jobs:
           node-version: ${{ inputs.node-version }}
           cache: npm
 
-      - run: ${{ inputs.install-command }}
+      - name: Install dependencies
+        run: ${{ inputs.install-command }}
 
-      # tsc -b, kyunki solution-style tsconfig ("files": []) par
-      # `tsc --noEmit` ek bhi file check nahi karta.
-      - name: TypeScript
+      - name: Check TypeScript
         if: inputs.typecheck-command != ''
         run: ${{ inputs.typecheck-command }}
 
-      - name: Lint
+      - name: Check lint
         if: inputs.lint-command != ''
         run: ${{ inputs.lint-command }}
 
-      - name: Tests
+      - name: Run tests
         if: inputs.test-command != ''
         run: ${{ inputs.test-command }}

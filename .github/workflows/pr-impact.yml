@@ -1,30 +1,29 @@
 name: PR Impact
 
-# Report banata hai — ye gate nahi hai. Merge rokne ke liye checks.yml ki
-# `tests` job ko required banao.
+# Reusable. Builds the impact report, comments it on the PR, and writes a
+# compact summary into the PR description so it ends up in the commit message
+# (Settings > General > Default commit message = "Pull request title and description").
+#
+# This is a report only — it is not a gate. To block merges, make the
+# `tests` job in the Checks workflow a required check.
 on:
   workflow_call:
     inputs:
       node-version:
+        description: Node version to run on.
         type: string
         default: '24'
-      install-command:
+      tools-path:
+        description: Directory this repo is checked out into, inside the caller workspace.
         type: string
-        default: 'npm ci'
-      source-dir:
-        description: Import graph kis folder ka bane.
-        type: string
-        default: 'src'
+        default: .ci-tools
       tools-ref:
-        description: ci-workflows ka wahi ref jis se ye workflow aaya.
+        description: Ref of ci_workflows to take the scripts from. Keep it equal to the @ref the caller uses.
         type: string
-        default: 'v1'
-      model:
-        type: string
-        default: 'claude-sonnet-4.5'
+        default: v1
     secrets:
       COPILOT_PAT:
-        description: Copilot prose ke liye. Na ho to sirf facts wali summary aayegi.
+        description: PAT for the Copilot-written prose. Without it, facts only.
         required: false
 
 permissions:
@@ -35,30 +34,39 @@ jobs:
   impact:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out the caller repo
-        uses: actions/checkout@v4
+      # Caller ka code workspace root par.
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Scripts central repo se aate hain — consumer repo mein kuch install
-      # nahi karna padta.
-      - name: Check out the tools
+      # Scripts aur depcruise config isi repo se aate hain, caller se nahi.
+      - name: Check out the shared tools
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/ci-workflows
+          repository: prasadnayak-sudo/ci_workflows
           ref: ${{ inputs.tools-ref }}
-          path: .ci-tools
+          path: ${{ inputs.tools-path }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ inputs.node-version }}
+          cache: npm
 
-      - name: Install the tools
-        working-directory: .ci-tools
-        run: npm ci --omit=dev --ignore-scripts || npm ci
+      - run: npm ci
+
+      # graph.mjs cwd mein config dhoondta hai aur `npx depcruise` chalata hai,
+      # isliye dono caller ke root par pohanchane padte hain.
+      - name: Set up dependency-cruiser
+        env:
+          TOOLS: ${{ inputs.tools-path }}
+        run: |
+          cp "$TOOLS/.dependency-cruiser.cjs" .
+          npm install --no-save 'dependency-cruiser@^18.3.1'
 
       - name: Collect changed files
         run: |
+          # No --depth here: checkout already fetched full history (fetch-depth: 0),
+          # and a shallow fetch would break the "git log BASE..HEAD" range.
           git fetch origin "${{ github.base_ref }}"
           BASE="origin/${{ github.base_ref }}"
           {
@@ -70,26 +78,27 @@ jobs:
             echo "GHEOF"
           } >> "$GITHUB_ENV"
 
+          # Diff for the AI prompt: lock file excluded and size capped.
           git diff "$BASE...HEAD" -- . ':(exclude)package-lock.json' | head -c 60000 > /tmp/diff.txt
 
       - name: Build the impact report
+        run: node "${{ inputs.tools-path }}/scripts/impact-report.mjs" > impact.md
         env:
           CHANGED_FILES: ${{ env.CHANGED_FILES }}
-          SOURCE_DIR: ${{ inputs.source-dir }}
-        run: node .ci-tools/scripts/impact-report.mjs > /tmp/impact.md
 
       - name: Comment on the PR
         uses: marocchino/sticky-pull-request-comment@v2
         with:
           header: pr-impact
-          path: /tmp/impact.md
+          path: impact.md
 
+      # The facts half of the description block. Always produced, with or
+      # without the AI.
       - name: Build the factual summary
         env:
           CHANGED_FILES: ${{ env.CHANGED_FILES }}
           COMMIT_LINES: ${{ env.COMMIT_LINES }}
-          SOURCE_DIR: ${{ inputs.source-dir }}
-        run: node .ci-tools/scripts/commit-summary.mjs > /tmp/facts.md
+        run: node "${{ inputs.tools-path }}/scripts/commit-summary.mjs" > /tmp/facts.md
 
       - name: Check whether Copilot is configured
         id: check
@@ -132,6 +141,7 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         run: npm install -g @github/copilot
 
+      # Best effort: if the AI step fails the description still gets the facts.
       - name: Ask Copilot to write the message
         id: ai
         if: steps.check.outputs.enabled == 'true'
@@ -139,7 +149,7 @@ jobs:
         uses: actions/ai-inference@v1
         with:
           prompt-file: /tmp/prompt.txt
-          model: ${{ inputs.model }}
+          model: claude-sonnet-4.5
           system-prompt: >-
             You write commit messages. Plain, specific, and short. You describe
             what changed and why it changed, never how impressive it is. Write
@@ -147,12 +157,17 @@ jobs:
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
 
+      # AI prose first, then the facts underneath.
       - name: Assemble the summary block
         env:
           AI_RESPONSE: ${{ steps.ai.outputs.response }}
         run: |
           if [ -n "$AI_RESPONSE" ]; then
-            { echo "$AI_RESPONSE"; echo; cat /tmp/facts.md; } > /tmp/summary.md
+            {
+              echo "$AI_RESPONSE"
+              echo
+              cat /tmp/facts.md
+            } > /tmp/summary.md
           else
             cp /tmp/facts.md /tmp/summary.md
           fi
@@ -165,5 +180,5 @@ jobs:
         run: |
           SUMMARY="$(cat /tmp/summary.md)"
           export SUMMARY
-          node .ci-tools/scripts/update-pr-body.mjs > /tmp/body.md
+          node "${{ inputs.tools-path }}/scripts/update-pr-body.mjs" > /tmp/body.md
           gh pr edit "$PR_NUMBER" --body-file /tmp/body.md
